@@ -20,4 +20,10 @@ summary(teams)
 head(spread)
 summary(spread)
 ```
+```{r}
+#Todo
+#1. Filter all games before the 79/80 season
+  #Note: not all games have weather
+#2. Do we need to create new tables?
+```
 
