@@ -1,0 +1,23 @@
+---
+title: "Model"
+format: pdf
+editor: visual
+---
+
+```{r}
+library(readr)
+
+teams <- read_csv("data/nfl_teams.csv")
+spread <- read_csv("data/spreadspoke_scores.csv")
+```
+
+```{r}
+head(teams)
+summary(teams)
+```
+
+```{r}
+head(spread)
+summary(spread)
+```
+
