@@ -6,7 +6,7 @@ editor: visual
 
 ```{r}
 library(readr)
-
+library(tidyverse)
 teams <- read_csv("data/nfl_teams.csv")
 spread <- read_csv("data/spreadspoke_scores.csv")
 ```
@@ -26,4 +26,42 @@ summary(spread)
   #Note: not all games have weather
 #2. Do we need to create new tables?
 ```
+
+#EDA
+```{r}
+library(ggplot2)
+
+ggplot(spread, aes(x = score_home)) +
+  geom_histogram(bins = 30, fill = "steelblue") +
+  labs(title = "Distribution of Home Team Scores")
+
+ggplot(spread, aes(x = score_away)) +
+  geom_histogram(bins = 30, fill = "tomato") +
+  labs(title = "Distribution of Away Team Scores")
+```
+```{r}
+# Calculate medians
+median_home  <- median(spread$score_home, na.rm = TRUE)
+median_away  <- median(spread$score_away, na.rm = TRUE)
+
+cat("Median Home Score:", median_home, "\n")
+cat("Median Away Score:", median_away, "\n")
+```
+
+```{r}
+spread$score_diff <- spread$score_home - spread$score_away
+
+ggplot(spread, aes(x = spread_favorite, y = score_diff)) +
+  geom_point(alpha = 0.4) +
+  labs(title = "Vegas Spread vs. Actual Score Difference")
+```
+```{r}
+team_perf <- spread |>
+  group_by(team_home) |>
+  summarise(avg_diff = mean(score_home - score_away, na.rm = TRUE)) |>
+  arrange(desc(avg_diff))
+
+head(team_perf, 10)
+```
+
 
