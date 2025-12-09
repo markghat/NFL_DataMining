@@ -1,11 +1,11 @@
 # Spreadspoke 
-setwd("~/Documents/R/nfl regression/spreadspoke")
+#setwd("Duke/F25/STA 325/Project/NFL_DataMining/data")
 ## update date line 188 for splitting historic and forecast nfl data
 
 nfl <- read.csv("spreadspoke_scores.csv", stringsAsFactors=F)
 nfl$schedule_date<-as.Date(nfl$schedule_date, "%m/%d/%Y") # format as date
 
-library(xlsx)
+#library(xlsx)
 #fileUrl <- "http://www.aussportsbetting.com/historical_data/nfl.xlsx" # money line, open/close lines historic info
 #download.file(fileUrl)
 #nfl_asb <- read.csv("nfl_2014_2017_asb.csv") 
