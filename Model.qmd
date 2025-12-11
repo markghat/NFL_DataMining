@@ -285,3 +285,153 @@ These variables reflect well-documented determinants of scoring margin in the NF
 The variable selection process removed schedule-week controls and division indicators, which did not provide predictive value once team strength and weather were included.
 
 The resulting model is more parsimonious, interpretable, and consistent with football analytics literature
+
+#Testing interaction terms
+```{r}
+# Interaction testing pipeline
+library(dplyr)
+library(pROC)
+
+# ------------- sanity checks -------------
+if(!exists("train_logit") || !exists("test_logit")) stop("train_logit and test_logit must exist. Create train/test split first.")
+
+# ensure binary target is numeric 0/1
+if(!("cover_binary" %in% names(train_logit))) stop("train_logit must contain cover_binary (0/1).")
+train_logit <- train_logit %>% mutate(cover_binary = as.numeric(cover_binary))
+test_logit  <- test_logit  %>% mutate(cover_binary = as.numeric(cover_binary))
+
+# ------------- pick base predictors -------------
+# Prefer previously-generated lists if present, otherwise use a default sensible set.
+if(exists("final_vars_for_glm") && length(final_vars_for_glm) > 0) {
+  base_vars <- final_vars_for_glm
+} else if(exists("clean_selected") && length(clean_selected) > 0) {
+  base_vars <- clean_selected
+} else {
+  base_vars <- c(
+    "elo_diff",
+    "score_avg_pts_for_roll_lag.x","score_avg_pts_against_roll_lag.x",
+    "score_avg_pts_for_roll_lag.y","score_avg_pts_against_roll_lag.y",
+    "weather_cold","weather_wind_bad","weather_rain","weather_snow"
+  )
+  message("Using fallback base_vars; consider setting final_vars_for_glm or running LASSO first.")
+}
+
+# Ensure base_vars exist in the training dataframe
+miss <- setdiff(base_vars, names(train_logit))
+if(length(miss)>0) stop("These base predictors are missing from train_logit: ", paste(miss, collapse = ", "))
+
+base_formula_str <- paste("cover_binary ~", paste(base_vars, collapse = " + "))
+base_formula <- as.formula(base_formula_str)
+message("Base formula: ", base_formula_str)
+
+# ------------- fit base model -------------
+base_glm <- glm(base_formula, data = train_logit, family = binomial)
+base_aic <- AIC(base_glm)
+
+# compute base test AUC (if test present)
+compute_auc_safe <- function(model, test_df) {
+  tryCatch({
+    preds <- predict(model, newdata = test_df, type = "response")
+    roc_obj <- roc(test_df$cover_binary, preds, quiet = TRUE)
+    as.numeric(auc(roc_obj))
+  }, error = function(e) {
+    NA_real_
+  })
+}
+base_auc <- compute_auc_safe(base_glm, test_logit)
+
+cat("Base model AIC:", round(base_aic,2), "  Base test AUC:", round(base_auc,4), "\n\n")
+
+# ------------- define interactions to test -------------
+interactions <- c(
+  "weather_wind_bad:elo_diff",
+  "weather_cold:score_avg_pts_for_roll_lag.x",
+  "score_avg_pts_for_roll_lag.x:score_avg_pts_against_roll_lag.y",
+  "elo_diff:score_avg_pts_for_roll_lag.y"
+)
+
+# ------------- loop over interactions and evaluate -------------
+results <- data.frame(
+  interaction = interactions,
+  aic = NA_real_,
+  delta_aic = NA_real_,
+  auc = NA_real_,
+  delta_auc = NA_real_,
+  coef = NA_real_,
+  se = NA_real_,
+  p_value = NA_real_,
+  keep = NA,
+  stringsAsFactors = FALSE
+)
+
+for(i in seq_along(interactions)) {
+  int_term <- interactions[i]
+  formula_i <- as.formula(paste(base_formula_str, "+", int_term))
+  cat("\nTesting interaction:", int_term, "\n")
+  glm_i <- tryCatch(glm(formula_i, data = train_logit, family = binomial),
+                    error = function(e) { warning("Model failed for interaction: ", int_term); return(NULL) })
+  if(is.null(glm_i)) {
+    results$aic[i] <- NA; results$auc[i] <- NA; results$delta_aic[i] <- NA; results$delta_auc[i] <- NA; results$keep[i] <- FALSE
+    next
+  }
+  aic_i <- AIC(glm_i)
+  auc_i <- compute_auc_safe(glm_i, test_logit)
+  # attempt to extract interaction coefficient, se, p-value
+  s <- summary(glm_i)
+  coef_name_variants <- c(int_term, gsub(":", ":", int_term), int_term) # keep simple
+  # find exact matching row in coefficients
+  coef_rows <- rownames(s$coefficients)
+  # matching is sometimes "weather_wind_bad:elo_diff" or "elo_diff:weather_wind_bad"; search both orders
+  possible_names <- c(int_term, paste(rev(strsplit(int_term, ":")[[1]]), collapse=":" ))
+  row_match <- intersect(possible_names, coef_rows)
+  if(length(row_match)==0){
+    # attempt partial match
+    row_match <- coef_rows[grepl(gsub(":", ".*", int_term), coef_rows)]
+  }
+  if(length(row_match) >= 1) {
+    r <- s$coefficients[row_match[1], ]
+    coef_val <- r["Estimate"]; se_val <- r["Std. Error"]; p_val <- r["Pr(>|z|)"]
+  } else {
+    coef_val <- NA; se_val <- NA; p_val <- NA
+  }
+  # record results
+  results$aic[i] <- aic_i
+  results$delta_aic[i] <- aic_i - base_aic
+  results$auc[i] <- auc_i
+  results$delta_auc[i] <- ifelse(is.na(base_auc)|is.na(auc_i), NA, auc_i - base_auc)
+  results$coef[i] <- coef_val
+  results$se[i] <- se_val
+  results$p_value[i] <- p_val
+  # decision rule: keep if AIC decreases AND AUC increases by at least 0.005
+  results$keep[i] <- (!is.na(results$delta_aic[i]) && results$delta_aic[i] < 0) &&
+                     (!is.na(results$delta_auc[i]) && results$delta_auc[i] >= 0.005)
+  cat(sprintf(" AIC(base)=%.2f  AIC(int)=%.2f  ΔAIC=%.2f | AUC(base)=%.4f  AUC(int)=%.4f  ΔAUC=%.4f\n",
+              base_aic, aic_i, results$delta_aic[i], base_auc, auc_i, results$delta_auc[i]))
+  cat(sprintf(" coef=%.4f  SE=%.4f  p=%.4f  -> Keep? %s\n",
+              ifelse(is.na(coef_val), NA, coef_val),
+              ifelse(is.na(se_val), NA, se_val),
+              ifelse(is.na(p_val), NA, p_val),
+              ifelse(results$keep[i], "YES", "NO")))
+}
+
+# ------------- summarize results -------------
+cat("\n\nInteraction test summary:\n")
+print(results)
+
+kept <- results$interaction[which(results$keep)]
+cat("\nInteractions to KEEP (by our rule):\n")
+print(kept)
+
+# ------------- if any kept, fit final model with them -------------
+if(length(kept) > 0) {
+  final_formula_with_kept <- as.formula(paste(base_formula_str, paste(kept, collapse = " + "), sep = " + "))
+  cat("\nFitting final model with kept interactions:\n")
+  print(final_formula_with_kept)
+  final_glm2 <- glm(final_formula_with_kept, data = train_logit, family = binomial)
+  cat("AIC final:", AIC(final_glm2), "  Test AUC final:", compute_auc_safe(final_glm2, test_logit), "\n")
+  print(summary(final_glm2))
+} else {
+  cat("\nNo interactions met the keep criteria (ΔAIC < 0 and ΔAUC >= 0.005). No final interaction model fitted.\n")
+}
+```
+
