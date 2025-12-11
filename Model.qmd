@@ -63,5 +63,180 @@ team_perf <- spread |>
 
 head(team_perf, 10)
 ```
+#Models
 
+#Model 1: Favorite Covers (Log)
+```{r}
+library(dplyr)
+
+# Filter out pushes
+nfl_logit <- nfl %>%
+  filter(spread_favorite_cover_result %in% c("Cover", "Did Not Cover")) %>%
+  mutate(cover_binary = ifelse(spread_favorite_cover_result == "Cover", 1, 0))
+
+# Train/test split (train up to 2012, test after)
+train_logit <- nfl_logit %>% filter(schedule_season <= 2012)
+test_logit  <- nfl_logit %>% filter(schedule_season >  2012)
+
+# Fit logistic regression model
+logit_model <- glm(
+  cover_binary ~ 
+      division_matchup +
+      team_home_favorite +
+      schedule_week +
+      team_home_elo_pre + team_away_elo_pre +
+      score_avg_pts_for_roll_lag.x + score_avg_pts_against_roll_lag.x +
+      score_avg_pts_for_roll_lag.y + score_avg_pts_against_roll_lag.y +
+      weather_cold + weather_wind_bad + weather_rain + weather_snow,
+  data = train_logit,
+  family = binomial(link = "logit")
+)
+
+summary(logit_model)
+
+# Predict on test set
+test_logit$pred_cover_prob <- predict(logit_model, newdata=test_logit, type="response")
+test_logit$pred_cover <- ifelse(test_logit$pred_cover_prob > 0.5, "Cover", "Did Not Cover")
+
+# Confusion matrix
+table(Predicted = test_logit$pred_cover,
+      Actual    = test_logit$spread_favorite_cover_result)
+```
+
+#LASSO Variable Selection
+```{r}
+library(glmnet)
+
+# --- Create Elo difference (if not already created) ---
+train_logit <- train_logit %>%
+  mutate(elo_diff = team_home_elo_pre - team_away_elo_pre)
+
+# --- Build model matrix for LASSO (no intercept column) ---
+X <- model.matrix(
+  cover_binary ~ elo_diff +
+                 score_avg_pts_for_roll_lag.x +
+                 score_avg_pts_against_roll_lag.x +
+                 score_avg_pts_for_roll_lag.y +
+                 score_avg_pts_against_roll_lag.y +
+                 weather_cold + weather_wind_bad +
+                 weather_rain + weather_snow,
+  data = train_logit
+)[,-1]   # remove intercept
+
+# Response
+y <- train_logit$cover_binary
+
+# --- LASSO with cross-validation ---
+cvfit <- cv.glmnet(X, y, family = "binomial", alpha = 1)
+plot(cvfit)
+
+best_lambda <- cvfit$lambda.min
+
+# Final LASSO model
+lasso_model <- glmnet(X, y, family = "binomial", alpha = 1, lambda = best_lambda)
+
+# Show non-zero coefficients
+coef(lasso_model)
+```
+
+**Interpretation:**
+The roll.x variables are for home teams and the roll.y variables are for away teams
+Away defensive stats matter more for covering than home defensive stats
+
+This is consistent with many NFL ATS studies:
+	•	Away defense performance tends to be more predictive of future scoring margin.
+	•	Home defense is usually more stable and partly encoded already in Elo difference.
+
+Thus LASSO is telling you:
+
+Away team weaknesses matter more for predicting whether the favorite covers.
+
+This aligns with domain intuition:
+	•	Home favorites tend to win anyway.
+	•	Whether they cover often depends on how well the away team can score.
+	
+	
+
+```{r}
+# ---------- LASSO VARIABLE SELECTION ----------
+X <- model.matrix(
+  cover_binary ~ elo_diff +
+    score_avg_pts_for_roll_lag.x +
+    score_avg_pts_against_roll_lag.x +
+    score_avg_pts_for_roll_lag.y +
+    score_avg_pts_against_roll_lag.y +
+    weather_cold + weather_wind_bad + weather_rain + weather_snow,
+  data = train_logit
+)[,-1]
+
+y <- train_logit$cover_binary
+
+cvfit <- cv.glmnet(X, y, family = "binomial", alpha = 1)
+best_lambda <- cvfit$lambda.min
+lasso_model <- glmnet(X, y, family = "binomial", alpha = 1, lambda = best_lambda)
+
+# Extract selected coefficient names
+coef_raw <- rownames(coef(lasso_model))[coef(lasso_model)[,1] != 0]
+coef_raw <- coef_raw[coef_raw != "(Intercept)"]
+
+print("Raw LASSO-selected variables:")
+print(coef_raw)
+
+# ---------- CLEAN VARIABLE NAMES ----------
+clean_names <- coef_raw
+
+# Convert dummy names like weather_coldTRUE → weather_cold
+clean_names <- gsub("TRUE$", "", clean_names)
+
+print("Clean variable names for glm():")
+print(clean_names)
+
+# ---------- BUILD FORMULA ----------
+formula_str <- paste("cover_binary ~", paste(clean_names, collapse = " + "))
+final_formula <- as.formula(formula_str)
+
+# Fit glm with CLEAN variable names
+final_logit_model <- glm(final_formula, data = train_logit, family = binomial)
+summary(final_logit_model)
+
+# ---------- PREDICT ON TEST ----------
+test_logit$pred_prob <- predict(final_logit_model, newdata = test_logit, type = "response")
+test_logit$pred_label <- ifelse(test_logit$pred_prob > 0.5, "Cover", "Did Not Cover")
+
+# ---------- CONFUSION MATRIX ----------
+cm <- table(Predicted = test_logit$pred_label,
+            Actual = test_logit$spread_favorite_cover_result)
+print(cm)
+```
+	
+#Model 2: Spread (GAM)
+```{r}
+library(mgcv)
+library(dplyr)
+
+# Continuous outcome: home scoring margin
+nfl_gam <- nfl %>%
+  mutate(spread_margin = score_home - score_away)
+
+# Train/test split
+train_gam <- nfl_gam %>% filter(schedule_season <= 2012)
+test_gam  <- nfl_gam %>% filter(schedule_season >  2012)
+
+# Fit GAM
+gam_model <- gam(
+  spread_margin ~ 
+      s(team_home_elo_pre) +
+      s(team_away_elo_pre) +
+      s(score_avg_pts_for_roll_lag.x) +
+      s(score_avg_pts_against_roll_lag.x) +
+      s(score_avg_pts_for_roll_lag.y) +
+      s(score_avg_pts_against_roll_lag.y) +
+      team_home_favorite +
+      weather_cold + weather_wind_bad + weather_rain + weather_snow,
+  data = train_gam
+)
+
+summary(gam_model)
+plot(gam_model, pages = 1, scheme = 1)
+```
 
