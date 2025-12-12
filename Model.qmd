@@ -248,7 +248,7 @@ The goal is not perfection — it’s interpretability + understanding which fac
 
 ⸻
 
-⭐ 4. What improved after selection?
+4. What improved after selection?
 
 ✔ Much more interpretable
 
@@ -576,4 +576,297 @@ Despite low AUC, the model reveals meaningful predictors—especially the intera
 This matches the central goal of your project:
 understanding which factors drive ATS outcomes, not outperforming Vegas.
 
-#Model 2: Spread (GAM)
+#Model 2: Point Differential (GAM)
+```{r}
+# ---------------------------
+# GAM: predict score_diff using 'spread' & 'teams' already loaded
+# ---------------------------
+library(mgcv)
+library(dplyr)
+library(ggplot2)
+if(!requireNamespace("yardstick", quietly = TRUE)) install.packages("yardstick")
+library(yardstick)
+
+# Defensive checks + basic derived features
+if(!exists("spread")) stop("Data frame `spread` not found. Run the earlier read_csv cells first.")
+df <- spread
+
+# ensure target exists
+if(!"score_diff" %in% names(df)) {
+  if(all(c("score_home","score_away") %in% names(df))) {
+    df <- df %>% mutate(score_diff = score_home - score_away)
+  } else stop("Neither score_diff nor (score_home, score_away) present in `spread`.")
+}
+
+# create elo_diff if available (used in earlier models)
+if(all(c("team_home_elo_pre","team_away_elo_pre") %in% names(df))) {
+  df <- df %>% mutate(elo_diff = team_home_elo_pre - team_away_elo_pre)
+}
+
+# Make team columns factors (for random effects)
+if("team_home" %in% names(df)) df$team_home <- as.factor(df$team_home)
+if("team_away" %in% names(df)) df$team_away <- as.factor(df$team_away)
+
+# Choose candidate smooth terms only if the columns exist
+has <- function(x) x %in% names(df)
+smooth_terms <- c()
+if(has("spread_favorite"))                          smooth_terms <- c(smooth_terms, "s(spread_favorite, k = 30)")
+if(has("elo_diff"))                                 smooth_terms <- c(smooth_terms, "s(elo_diff, k = 20)")
+if(has("score_avg_pts_for_roll_lag.x"))             smooth_terms <- c(smooth_terms, "s(score_avg_pts_for_roll_lag.x, k = 15)")
+if(has("score_avg_pts_for_roll_lag.y"))             smooth_terms <- c(smooth_terms, "s(score_avg_pts_for_roll_lag.y, k = 15)")
+if(has("score_avg_pts_against_roll_lag.y"))         smooth_terms <- c(smooth_terms, "s(score_avg_pts_against_roll_lag.y, k = 15)")
+if(has("weather_temperature"))                      smooth_terms <- c(smooth_terms, "s(weather_temperature, k = 10)")
+if(has("weather_wind_mph"))                        smooth_terms <- c(smooth_terms, "s(weather_wind_mph, k = 10)")
+if(has("weather_humidity"))                        smooth_terms <- c(smooth_terms, "s(weather_humidity, k = 10)")
+if(has("schedule_season"))                          smooth_terms <- c(smooth_terms, "s(schedule_season, k = 8)")
+
+# Add team random intercepts (compact)
+if(has("team_home")) smooth_terms <- c(smooth_terms, "s(team_home, bs = 're')")
+if(has("team_away")) smooth_terms <- c(smooth_terms, "s(team_away, bs = 're')")
+
+# Optionally add a tensor interaction if both elo_diff and away offense roll exist (you used this earlier)
+if(has("elo_diff") && has("score_avg_pts_for_roll_lag.y")){
+  smooth_terms <- c(smooth_terms, "te(elo_diff, score_avg_pts_for_roll_lag.y, k = c(8,8))")
+}
+
+# Build formula
+if(length(smooth_terms) == 0) stop("No candidate predictors found for GAM. Check column names.")
+form_rhs <- paste(smooth_terms, collapse = " + ")
+gam_formula <- as.formula(paste("score_diff ~", form_rhs))
+message("GAM formula: ", deparse(gam_formula))
+
+# Train/test split consistent with your logistic setup: train <= 2012, test > 2012 when season exists
+if("schedule_season" %in% names(df) && !all(is.na(df$schedule_season))){
+  train <- df %>% filter(schedule_season <= 2012)
+  test  <- df %>% filter(schedule_season >  2012)
+  # fallback to random split if temporal split gives too-small test/training sets
+  if(nrow(train) < 200 | nrow(test) < 200){
+    set.seed(2025)
+    idx <- sample(nrow(df))
+    train <- df[idx <= 0.8*nrow(df), ]
+    test  <- df[idx  > 0.8*nrow(df), ]
+    message("Temporal split produced small sets; using random 80/20 split instead.")
+  } else {
+    message("Using seasons <=2012 as training and >2012 as test.")
+  }
+} else {
+  set.seed(2025)
+  idx <- sample(nrow(df))
+  train <- df[idx <= 0.8*nrow(df), ]
+  test  <- df[idx  > 0.8*nrow(df), ]
+  message("No schedule_season available; used random 80/20 split.")
+}
+
+# Fit GAM with REML; mgcv will penalize unused smooths if select=TRUE
+gam_fit <- tryCatch(
+  mgcv::gam(gam_formula, data = train, method = "REML", select = TRUE),
+  error = function(e){
+    message("GAM fitting error (trying more conservative k): ", conditionMessage(e))
+    # Attempt again with smaller ks by replacing numbers >10 with 8
+    form2 <- gsub("k = [0-9]+", "k = 8", deparse(gam_formula))
+    mgcv::gam(as.formula(form2), data = train, method = "REML", select = TRUE)
+  }
+)
+
+# Summarize & plot
+cat("\nGAM summary:\n")
+print(summary(gam_fit))
+
+# Single-page smooth plots
+plot(gam_fit, pages = 1, shade = TRUE)
+
+# Predictions on test set and evaluation
+test <- test %>% mutate(pred = predict(gam_fit, newdata = test, type = "response"))
+rmse_val <- yardstick::rmse_vec(truth = test$score_diff, estimate = test$pred)
+mae_val  <- yardstick::mae_vec(truth = test$score_diff, estimate = test$pred)
+message("Test RMSE: ", round(rmse_val, 3), " ; MAE: ", round(mae_val, 3))
+
+# Quick Actual vs Predicted plot
+ggplot(test, aes(x = pred, y = score_diff)) +
+  geom_point(alpha = 0.35) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "GAM: Actual vs Predicted (test)", x = "Predicted score_diff", y = "Actual score_diff")
+```
+```{r}
+# GAM using the same features used in your X_train for LASSO/GLM
+library(mgcv)
+library(dplyr)
+library(pROC)
+
+# sanity checks
+if(!exists("train_logit") || !exists("test_logit")){
+  stop("Please create train_logit and test_logit first (as in your logistic pipeline).")
+}
+
+# Ensure binary target exists and is numeric 0/1
+train_gam <- train_logit %>% mutate(cover_binary = as.numeric(cover_binary))
+test_gam  <- test_logit  %>% mutate(cover_binary = as.numeric(cover_binary))
+
+# The features you used in X_train
+numeric_candidates <- c(
+  "elo_diff",
+  "score_avg_pts_for_roll_lag.x",
+  "score_avg_pts_against_roll_lag.x",
+  "score_avg_pts_for_roll_lag.y",
+  "score_avg_pts_against_roll_lag.y"
+)
+weather_candidates <- c("weather_cold", "weather_wind_bad", "weather_rain", "weather_snow")
+
+# detect which columns actually exist
+num_present   <- numeric_candidates[numeric_candidates %in% names(train_gam)]
+weath_present <- weather_candidates[weather_candidates %in% names(train_gam)]
+
+if(length(num_present) == 0 && length(weath_present) == 0){
+  stop("None of the expected predictor columns are present in train_logit. Found: ",
+       paste(names(train_gam), collapse = ", "))
+}
+
+message("Numeric predictors found: ", paste(num_present, collapse = ", "))
+message("Weather predictors found: ", paste(weath_present, collapse = ", "))
+
+# Build formula pieces: smooths for numeric, linear terms for weather flags
+smooth_terms <- if(length(num_present)>0) {
+  paste0("s(", num_present, ", k = 20)")
+} else character(0)
+
+# cast weather columns to numeric 0/1 if present (safe)
+for(w in weath_present){
+  # convert logical/character factors to 0/1 numeric
+  test_vals <- train_gam[[w]]
+  if(is.logical(test_vals) || is.character(test_vals) || is.factor(test_vals)){
+    train_gam[[w]] <- ifelse(train_gam[[w]] %in% c(TRUE, "TRUE", "True", "1", 1), 1, 0)
+    test_gam[[w]]  <- ifelse(test_gam[[w]] %in% c(TRUE, "TRUE", "True", "1", 1), 1, 0)
+  } else {
+    # leave numeric as-is (assume 0/1)
+    train_gam[[w]] <- as.numeric(train_gam[[w]])
+    test_gam[[w]]  <- as.numeric(test_gam[[w]])
+  }
+}
+weather_terms <- weath_present
+
+# Interaction: add tensor interaction if both elo_diff & away offense exist
+interaction_term <- NULL
+if(all(c("elo_diff","score_avg_pts_for_roll_lag.y") %in% num_present)){
+  interaction_term <- paste0("ti(elo_diff, score_avg_pts_for_roll_lag.y, k = c(10,10))")
+  message("Including tensor interaction: elo_diff x score_avg_pts_for_roll_lag.y")
+} else {
+  message("Not including tensor interaction (missing elo_diff or score_avg_pts_for_roll_lag.y).")
+}
+
+# Compose RHS
+rhs_terms <- c(smooth_terms, weather_terms)
+if(!is.null(interaction_term)) rhs_terms <- c(rhs_terms, interaction_term)
+form_rhs <- paste(rhs_terms, collapse = " + ")
+gam_formula <- as.formula(paste("cover_binary ~", form_rhs))
+
+message("GAM formula: ", deparse(gam_formula))
+
+# Ensure factor levels in train/test are aligned for any factor columns (safety)
+fac_cols <- intersect(names(train_gam)[sapply(train_gam, is.factor)], names(test_gam))
+for(fc in fac_cols){
+  lv <- union(levels(train_gam[[fc]]), levels(test_gam[[fc]]))
+  train_gam[[fc]] <- factor(train_gam[[fc]], levels = lv)
+  test_gam[[fc]]  <- factor(test_gam[[fc]], levels = lv)
+}
+
+# Fit GAM (binomial/logit)
+set.seed(2025)
+gam_model <- tryCatch(
+  mgcv::gam(gam_formula, data = train_gam, family = binomial(link = "logit"), method = "REML", select = TRUE),
+  error = function(e){
+    message("Initial GAM fit error: ", conditionMessage(e))
+    message("Retrying with smaller k values (k = 8).")
+    # replace 'k = [0-9]+' and 'k = c(..., ...)' to k=8
+    f2 <- gsub("k = [0-9]+", "k = 8", deparse(gam_formula))
+    f2 <- gsub("k = c\\([0-9]+,[0-9]+\\)", "k = c(8,8)", f2)
+    mgcv::gam(as.formula(f2), data = train_gam, family = binomial(link = "logit"), method = "REML", select = TRUE)
+  }
+)
+
+# Output
+cat("\n=== GAM Summary ===\n")
+print(summary(gam_model))
+
+# Plot smooths (single page)
+try(plot(gam_model, pages = 1, shade = TRUE), silent = TRUE)
+
+# Predict on test
+test_gam$pred_prob <- predict(gam_model, newdata = test_gam, type = "response")
+test_gam$pred_label <- ifelse(test_gam$pred_prob > 0.5, "Cover", "Did Not Cover")
+
+# Confusion table (use original label if available)
+actual_col <- if("spread_favorite_cover_result" %in% names(test_gam)) "spread_favorite_cover_result" else "cover_binary"
+conf_table <- table(Predicted = test_gam$pred_label, Actual = test_gam[[actual_col]])
+cat("\n=== Confusion Table ===\n"); print(conf_table)
+
+# AUC
+if(requireNamespace("pROC", quietly = TRUE)){
+  truth <- test_gam$cover_binary
+  if(all(is.na(truth))){
+    message("Cannot compute AUC: cover_binary all NA in test set.")
+  } else {
+    roc_obj <- pROC::roc(truth, test_gam$pred_prob, quiet = TRUE)
+    cat("\nTest AUC:", round(as.numeric(pROC::auc(roc_obj)), 4), "\n")
+  }
+}
+
+# Report used predictors
+cat("\nColumns used in the GAM formula (present in train):\n")
+print(list(numeric = num_present, weather = weath_present, interaction_included = !is.null(interaction_term)))
+```
+#GAM (refined)
+```{r}
+library(mgcv)
+library(dplyr)
+library(pROC)
+
+# Use existing train_logit/test_logit
+train_gam <- train_logit %>% mutate(cover_binary = as.numeric(cover_binary))
+test_gam  <- test_logit  %>% mutate(cover_binary = as.numeric(cover_binary))
+
+refined_formula <- cover_binary ~ 
+  s(score_avg_pts_for_roll_lag.y, k = 20) +
+  s(score_avg_pts_against_roll_lag.y, k = 20) +
+  s(score_avg_pts_for_roll_lag.x, k = 20) +
+  ti(elo_diff, score_avg_pts_for_roll_lag.y, k = c(10,10))
+
+message("Fitting refined parsimonious GAM...")
+
+gam_refined <- gam(
+  refined_formula,
+  data = train_gam,
+  family = binomial(link = "logit"),
+  method = "REML",
+  select = TRUE
+)
+
+summary(gam_refined)
+plot(gam_refined, pages = 1, shade = TRUE)
+
+# Evaluate
+test_gam$pred_prob <- predict(gam_refined, newdata = test_gam, type = "response")
+test_gam$pred_label <- ifelse(test_gam$pred_prob > 0.5, "Cover", "Did Not Cover")
+
+cat("\nConfusion Matrix:\n")
+print(table(
+  Predicted = test_gam$pred_label,
+  Actual = test_gam$spread_favorite_cover_result
+))
+
+# AUC
+roc_obj <- roc(test_gam$cover_binary, test_gam$pred_prob, quiet = TRUE)
+cat("\nRefined GAM Test AUC:", round(as.numeric(auc(roc_obj)), 4), "\n")
+```
+
+The refined generalized additive model indicates that whether the favorite covers the point spread is driven primarily by the recent performance of the underdog, especially its offensive production. The smooth function for the underdog’s rolling offensive average is strongly positive and nonlinear: favorites are disproportionately likely to cover when the underdog’s offense has been performing poorly, but this advantage diminishes and eventually reverses as the underdog’s offensive output improves. In other words, when the underdog is scoring well entering the game, the favorite’s probability of covering the spread drops sharply.
+
+Similarly, the underdog’s recent defensive performance exhibits a significant nonlinear effect. Favorites cover more often when the underdog has been allowing many points, while strong underdog defensive form reduces the probability of a cover. This defensive effect is weaker than the offensive effect but remains statistically meaningful.
+
+The home team’s recent offensive form plays a comparatively minor role. Although statistically significant, the home team’s offensive momentum provides only a small lift in cover probability, indicating that ATS outcomes are more sensitive to the underdog’s performance than the favorite’s.
+
+The interaction between team strength (Elo difference) and underdog offensive form is substantial and strongly nonlinear. The model shows that team strength mismatches matter only when the underdog’s offense is weak. When the underdog offense is performing well, differences in pre-game Elo have little effect on the outcome: even a large Elo advantage for the favorite fails to meaningfully increase the probability of covering. Conversely, when the underdog offense is weak, Elo differences amplify cover probability. This indicates that Elo strength is conditional—not universally predictive—but relevant only in favorable matchup contexts.
+
+Overall, the refined GAM suggests that ATS outcomes are governed by nonlinear interactions between team strength and the recent form of the underdog, rather than by linear effects of team quality or weather conditions. The model explains modest variance—as expected for spread-based predictions—but provides clear structural insight into the mechanisms influencing cover probability.
+
+#Additional inferences from GAM
+The GAM reveals that cover outcomes depend on strongly nonlinear relationships in the data, particularly in the performance of the underdog. Away-team offensive and defensive momentum exert asymmetric and nonlinear influences that the logistic regression treats as linear. The GAM also shows that Elo differences matter only conditionally: they influence cover probability only when the underdog offense is weak, a phenomenon not detectable through the linear interaction term in the logistic model. Furthermore, the GAM uncovers threshold effects, plateaus, and curvature that the GLM cannot capture, allowing much richer interpretations of how team form interacts with team strength to shape ATS outcomes. Overall, the GAM provides a deeper and more accurate description of the structural forces behind spread performance than the logistic model, even if both models achieve similar predictive accuracy.
