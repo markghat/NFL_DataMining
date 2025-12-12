@@ -350,6 +350,7 @@ interactions <- c(
   "elo_diff:score_avg_pts_for_roll_lag.y"
 )
 
+
 # ------------- loop over interactions and evaluate -------------
 results <- data.frame(
   interaction = interactions,
@@ -434,4 +435,145 @@ if(length(kept) > 0) {
   cat("\nNo interactions met the keep criteria (ΔAIC < 0 and ΔAUC >= 0.005). No final interaction model fitted.\n")
 }
 ```
+Whether the favorite covers is not only about how strong they are, but also about how well the underdog’s offense has been performing recently.
 
+This interaction materially improves model fit and predictive accuracy.
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# 1. Create a grid of values for prediction
+elo_seq <- seq(min(train_logit$elo_diff, na.rm=TRUE),
+               max(train_logit$elo_diff, na.rm=TRUE),
+               length.out = 100)
+
+away_off_seq <- quantile(train_logit$score_avg_pts_for_roll_lag.y,
+                         probs = c(0.10, 0.50, 0.90), na.rm=TRUE)
+
+# Use these quantiles as "weak", "average", "strong" away offense
+away_labels <- c("Weak Underdog Offense (10th %ile)",
+                 "Average Underdog Offense (50th %ile)",
+                 "Strong Underdog Offense (90th %ile)")
+
+plot_df <- expand.grid(
+  elo_diff = elo_seq,
+  score_avg_pts_for_roll_lag.y = away_off_seq
+)
+
+# For all other variables, hold at mean or reference level
+# (This makes plot interpretable & isolates interaction effect)
+plot_df$score_avg_pts_for_roll_lag.x <- mean(train_logit$score_avg_pts_for_roll_lag.x, na.rm=TRUE)
+plot_df$score_avg_pts_against_roll_lag.y <- mean(train_logit$score_avg_pts_against_roll_lag.y, na.rm=TRUE)
+plot_df$weather_rain <- FALSE
+plot_df$weather_snow <- FALSE
+
+# Use the interaction-capable model (the one that includes elo_diff:score_avg...y)
+plot_df$pred_prob <- predict(final_glm2, newdata = plot_df, type = "response")
+
+# Label offense tiers
+plot_df$underdog_offense <- factor(plot_df$score_avg_pts_for_roll_lag.y,
+                                   labels = away_labels)
+
+# 2. ggplot interaction curves
+ggplot(plot_df, aes(x = elo_diff, y = pred_prob,
+                    color = underdog_offense)) +
+  geom_line(size = 1.4) +
+  labs(
+    title = "Interaction Effect:\nElo Difference × Underdog Offensive Form",
+    x = "Elo Difference (Home – Away)",
+    y = "Predicted Probability of Favorite Covering",
+    color = "Away Offense Strength"
+  ) +
+  theme_minimal(base_size = 14) +
+  scale_color_brewer(palette = "Dark2") +
+  theme(legend.position = "top")
+```
+The X-axis:
+
+Elo Difference (Home – Away)
+	•	Negative → Away team stronger
+	•	Positive → Home team stronger (favorite)
+
+The Three Lines:
+
+Each line is the predicted probability that the favorite covers, given a different level of underdog (away team) offensive strength:
+	1.	Weak Underdog Offense (green, 10th percentile)
+	2.	Average Underdog Offense (orange, 50th percentile)
+	3.	Strong Underdog Offense (purple, 90th percentile)
+
+The Y-axis:
+
+Probability that the favorite covers the point spread
+
+The interaction plot reveals a critical nonlinearity in ATS outcomes and underscores the importance of the detected interaction effect in the final model. Specifically, the relationship between Elo difference and the probability that the favorite covers the spread depends strongly on the underdog’s recent offensive form. When the underdog offense is weak, Elo difference exhibits a large positive effect: stronger favorites are substantially more likely to cover. In contrast, when the underdog offense is average, Elo mismatch provides almost no predictive advantage, flattening the relationship entirely. Most strikingly, when the underdog offense is strong, even large Elo differences fail to translate into higher cover probability. This interaction effect—statistically significant and materially improving model fit—indicates that team-strength mismatches matter only when the underdog struggles offensively. Put differently, favorites cover primarily when opponents cannot generate sustained scoring drives, confirming the intuition that raw strength disparities are insufficient to explain ATS outcomes without accounting for offensive momentum on the opposing side.
+
+#Final Log Model:
+```{r}
+# Final logistic model using LASSO-selected predictors + chosen interaction
+# Assumes `train_logit` and `test_logit` already exist in the environment.
+
+# minimal checks & ensure target is numeric 0/1
+train_logit <- train_logit %>% mutate(cover_binary = as.numeric(cover_binary))
+test_logit  <- test_logit  %>% mutate(cover_binary = as.numeric(cover_binary))
+
+# formula using the LASSO-selected variables and the chosen interaction
+final_formula_with_kept <- cover_binary ~
+  elo_diff +
+  score_avg_pts_for_roll_lag.x +
+  score_avg_pts_for_roll_lag.y +
+  score_avg_pts_against_roll_lag.y +
+  weather_rain + 
+  elo_diff:score_avg_pts_for_roll_lag.y
+
+# fit the logistic model
+final_glm <- glm(final_formula_with_kept, data = train_logit, family = binomial)
+
+# summary (coefficients, p-values)
+print(summary(final_glm))
+
+# predict on test set (probabilities and 0.5 threshold class)
+test_logit$pred_prob <- predict(final_glm, newdata = test_logit, type = "response")
+test_logit$pred_label <- ifelse(test_logit$pred_prob > 0.5, "Cover", "Did Not Cover")
+
+# confusion table
+conf_table <- table(Predicted = test_logit$pred_label,
+                    Actual    = test_logit$spread_favorite_cover_result)
+print(conf_table)
+
+# optional: AUC (if pROC installed)
+if(requireNamespace("pROC", quietly = TRUE)){
+  roc_obj <- pROC::roc(test_logit$cover_binary, test_logit$pred_prob, quiet = TRUE)
+  cat("Test AUC:", round(as.numeric(pROC::auc(roc_obj)), 4), "\n")
+}
+```
+```{r}
+library(pROC)
+
+roc_obj <- roc(test_logit$cover_binary, test_logit$pred_prob)
+
+ggplot(data.frame(
+  fpr = 1 - roc_obj$specificities,
+  tpr = roc_obj$sensitivities
+), aes(x=fpr, y=tpr)) +
+  geom_line(color="steelblue", size=1.2) +
+  geom_abline(linetype="dashed", color="gray50") +
+  labs(title=paste("ROC Curve (AUC =", round(auc(roc_obj), 3), ")"),
+       x="False Positive Rate",
+       y="True Positive Rate") +
+  theme_minimal(base_size = 14)
+```
+
+
+r ROC curve lies only modestly above the diagonal reference line. This means:
+	•	The model has some ability to rank games correctly (favorites who are more likely to cover tend to have higher predicted probabilities),
+	•	But the separation between positive and negative cases is small.
+
+4. Why this is still valuable
+
+Despite low AUC, the model reveals meaningful predictors—especially the interaction between Elo difference and underdog offensive form—which reflects real football dynamics. The model is therefore interpretively useful even if not strongly discriminative.
+
+This matches the central goal of your project:
+understanding which factors drive ATS outcomes, not outperforming Vegas.
+
+#Model 2: Spread (GAM)
