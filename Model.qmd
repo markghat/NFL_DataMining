@@ -452,9 +452,9 @@ away_off_seq <- quantile(train_logit$score_avg_pts_for_roll_lag.y,
                          probs = c(0.10, 0.50, 0.90), na.rm=TRUE)
 
 # Use these quantiles as "weak", "average", "strong" away offense
-away_labels <- c("Weak Underdog Offense (10th %ile)",
-                 "Average Underdog Offense (50th %ile)",
-                 "Strong Underdog Offense (90th %ile)")
+away_labels <- c("Weak (10th %ile)",
+                 "Avg. (50th %ile)",
+                 "Strong (90th %ile)")
 
 plot_df <- expand.grid(
   elo_diff = elo_seq,
@@ -565,7 +565,7 @@ ggplot(data.frame(
 ```
 
 
-r ROC curve lies only modestly above the diagonal reference line. This means:
+ROC curve lies only modestly above the diagonal reference line. This means:
 	•	The model has some ability to rank games correctly (favorites who are more likely to cover tend to have higher predicted probabilities),
 	•	But the separation between positive and negative cases is small.
 
@@ -814,59 +814,6 @@ if(requireNamespace("pROC", quietly = TRUE)){
 cat("\nColumns used in the GAM formula (present in train):\n")
 print(list(numeric = num_present, weather = weath_present, interaction_included = !is.null(interaction_term)))
 ```
-#GAM (refined)
-```{r}
-library(mgcv)
-library(dplyr)
-library(pROC)
-
-# Use existing train_logit/test_logit
-train_gam <- train_logit %>% mutate(cover_binary = as.numeric(cover_binary))
-test_gam  <- test_logit  %>% mutate(cover_binary = as.numeric(cover_binary))
-
-refined_formula <- cover_binary ~ 
-  s(score_avg_pts_for_roll_lag.y, k = 20) +
-  s(score_avg_pts_against_roll_lag.y, k = 20) +
-  s(score_avg_pts_for_roll_lag.x, k = 20) +
-  ti(elo_diff, score_avg_pts_for_roll_lag.y, k = c(10,10))
-
-message("Fitting refined parsimonious GAM...")
-
-gam_refined <- gam(
-  refined_formula,
-  data = train_gam,
-  family = binomial(link = "logit"),
-  method = "REML",
-  select = TRUE
-)
-
-summary(gam_refined)
-plot(gam_refined, pages = 1, shade = TRUE)
-
-# Evaluate
-test_gam$pred_prob <- predict(gam_refined, newdata = test_gam, type = "response")
-test_gam$pred_label <- ifelse(test_gam$pred_prob > 0.5, "Cover", "Did Not Cover")
-
-cat("\nConfusion Matrix:\n")
-print(table(
-  Predicted = test_gam$pred_label,
-  Actual = test_gam$spread_favorite_cover_result
-))
-
-# AUC
-roc_obj <- roc(test_gam$cover_binary, test_gam$pred_prob, quiet = TRUE)
-cat("\nRefined GAM Test AUC:", round(as.numeric(auc(roc_obj)), 4), "\n")
-```
-
-The refined generalized additive model indicates that whether the favorite covers the point spread is driven primarily by the recent performance of the underdog, especially its offensive production. The smooth function for the underdog’s rolling offensive average is strongly positive and nonlinear: favorites are disproportionately likely to cover when the underdog’s offense has been performing poorly, but this advantage diminishes and eventually reverses as the underdog’s offensive output improves. In other words, when the underdog is scoring well entering the game, the favorite’s probability of covering the spread drops sharply.
-
-Similarly, the underdog’s recent defensive performance exhibits a significant nonlinear effect. Favorites cover more often when the underdog has been allowing many points, while strong underdog defensive form reduces the probability of a cover. This defensive effect is weaker than the offensive effect but remains statistically meaningful.
-
-The home team’s recent offensive form plays a comparatively minor role. Although statistically significant, the home team’s offensive momentum provides only a small lift in cover probability, indicating that ATS outcomes are more sensitive to the underdog’s performance than the favorite’s.
-
-The interaction between team strength (Elo difference) and underdog offensive form is substantial and strongly nonlinear. The model shows that team strength mismatches matter only when the underdog’s offense is weak. When the underdog offense is performing well, differences in pre-game Elo have little effect on the outcome: even a large Elo advantage for the favorite fails to meaningfully increase the probability of covering. Conversely, when the underdog offense is weak, Elo differences amplify cover probability. This indicates that Elo strength is conditional—not universally predictive—but relevant only in favorable matchup contexts.
-
-Overall, the refined GAM suggests that ATS outcomes are governed by nonlinear interactions between team strength and the recent form of the underdog, rather than by linear effects of team quality or weather conditions. The model explains modest variance—as expected for spread-based predictions—but provides clear structural insight into the mechanisms influencing cover probability.
 
 #Additional inferences from GAM
 The GAM reveals that cover outcomes depend on strongly nonlinear relationships in the data, particularly in the performance of the underdog. Away-team offensive and defensive momentum exert asymmetric and nonlinear influences that the logistic regression treats as linear. The GAM also shows that Elo differences matter only conditionally: they influence cover probability only when the underdog offense is weak, a phenomenon not detectable through the linear interaction term in the logistic model. Furthermore, the GAM uncovers threshold effects, plateaus, and curvature that the GLM cannot capture, allowing much richer interpretations of how team form interacts with team strength to shape ATS outcomes. Overall, the GAM provides a deeper and more accurate description of the structural forces behind spread performance than the logistic model, even if both models achieve similar predictive accuracy.
